@@ -46,7 +46,6 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
     func cancelTimerNotification() {
         UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: ["timer_done"])
     }
-    // ❗️Без звука в foreground, чтобы не было "двойного" воспроизведения
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 willPresent n: UNNotification) async -> UNNotificationPresentationOptions {
         [.banner, .list] // no .sound in foreground
@@ -61,10 +60,8 @@ final class SoundPlayer {
     private var vibrationTimer: Timer?
     private init() {}
 
-    /// Preview: stop any previous audio, then play bundled file if present; otherwise short system sound.
-    /// (Preview does NOT vibrate.)
     func preview(tone: Ringtone) {
-        stop() // 🔧 фикс: выключаем предыдущее превью, чтобы звуки не накладывались
+        stop()
         if let file = tone.bundledFileName, let url = Bundle.main.url(forResource: file, withExtension: nil) {
             playBundled(url: url, loop: false, withVibration: false)
         } else {
@@ -72,8 +69,6 @@ final class SoundPlayer {
         }
     }
 
-    /// Timer finished: play bundled file if present; otherwise fallback to a system sound.
-    /// Vibrate while playing if `vibrate == true`.
     func playEndSound(customFileName: String?, vibrate: Bool) {
         if let name = customFileName, let url = Bundle.main.url(forResource: name, withExtension: nil) {
             playBundled(url: url, loop: true, withVibration: vibrate)
@@ -100,15 +95,12 @@ final class SoundPlayer {
             player?.numberOfLoops = loop ? -1 : 0
             player?.prepareToPlay()
             player?.play()
-
             if withVibration { startVibrationLoop() } else { stopVibrationLoop() }
         } catch {
             AudioServicesPlaySystemSound(1005)
             if withVibration { startVibrationLoop() }
         }
     }
-
-    // MARK: Vibration helpers
 
     private func startVibrationLoop() {
         stopVibrationLoop()
@@ -163,17 +155,93 @@ struct ContentView: View {
         presetRingtones.first(where: { $0.title == selectedRingtoneTitle }) ?? presetRingtones[0]
     }
 
+    // отображаемое время и прогресс кольца
+    private var remainingToDisplay: Int {
+        switch state {
+        case .idle:     return pickedTotal
+        case .running,
+             .paused:   return remaining
+        case .finished: return 0
+        }
+    }
+    private var progress: CGFloat {
+        guard state != .idle else { return 0 }
+        let total = max(1, (state == .finished ? 1 : pickedTotal))
+        let done  = CGFloat(total - remaining)
+        return min(max(done / CGFloat(total), 0), 1)
+    }
+
+    // фишки: пульсация и динамический оттенок
+    @State private var pulse = false
+    @State private var animationID = UUID()   // ★ ключ для «пересоздания» вью, чтобы убить repeatForever
+    private var isFinalCountdown: Bool {
+        state == .running && remaining <= 5 && remaining > 0
+    }
+    private var hueShift: Double { 0.78 - 0.08 * Double(progress) } // 0.78 → 0.70
+
     var body: some View {
         NavigationStack {
             VStack(spacing: 24) {
 
-                if state == .idle || state == .finished {
+                // градиентное кольцо с временем
+                GeometryReader { geo in
+                    let side = min(geo.size.width, geo.size.height) * 0.86
+                    ZStack {
+                        GradientRing(
+                            progress: progress,
+                            lineWidth: max(14, side * 0.06),
+                            startHue: hueShift,
+                            endHue:   hueShift + 0.07
+                        )
+                        .frame(width: side, height: side)
+                        .scaleEffect(isFinalCountdown && pulse ? 1.03 : 1.0)
+
+                        Text(formatted(remainingToDisplay))
+                            .font(.system(size: max(36, side * 0.16), weight: .semibold, design: .rounded))
+                            .monospacedDigit()
+                            .minimumScaleFactor(0.6)
+                            .contentTransition(.numericText())
+                            .opacity(state == .paused && pulse ? 0.65 : 1)
+                    }
+                    .id(animationID) // ★ пересоздаём ZStack при reset, чтобы обрубить анимации
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                    // тап по кольцу — пауза/продолжить
+                    .onTapGesture {
+                        if state == .running {
+                            state = .paused
+                            NotificationManager.shared.cancelTimerNotification()
+                        } else if state == .paused {
+                            state = .running
+                            rescheduleNotification(seconds: remaining)
+                        }
+                    }
+                    // управление пульсацией на финише (iOS 17 форма onChange)
+                    .onChange(of: isFinalCountdown) { _, on in
+                        if on {
+                            withAnimation(.easeInOut(duration: 0.6).repeatForever(autoreverses: true)) {
+                                pulse = true
+                            }
+                        } else {
+                            pulse = false
+                        }
+                    }
+                    // «дыхание» в паузе
+                    .onChange(of: state) { _, new in
+                        if new == .paused {
+                            withAnimation(.easeInOut(duration: 1.0).repeatForever(autoreverses: true)) {
+                                pulse = true
+                            }
+                        } else if !isFinalCountdown {
+                            pulse = false
+                        }
+                    }
+                }
+                .aspectRatio(1, contentMode: .fit)
+
+                // пикеры показываем в idle/paused
+                if state == .idle || state == .paused {
                     durationPicker
                 }
-
-                Text(formatted((state == .idle || state == .finished) ? pickedTotal : remaining))
-                    .font(.system(size: 48, weight: .semibold, design: .rounded))
-                    .monospacedDigit()
 
                 HStack(spacing: 16) {
                     Button {
@@ -208,10 +276,7 @@ struct ContentView: View {
                     .disabled(state != .running)
 
                     Button {
-                        state = .idle
-                        remaining = 0
-                        NotificationManager.shared.cancelTimerNotification()
-                        stopRingtoneIfNeeded()
+                        hardReset() // ★ жёсткий сброс: стоп анимаций, звука и таймера
                     } label: {
                         Label("Stop", systemImage: "stop.fill")
                     }
@@ -223,7 +288,7 @@ struct ContentView: View {
 
                 if isRinging {
                     Button {
-                        stopRingtoneIfNeeded()
+                        hardReset() // ★ стоп звука и анимаций + сброс в idle
                     } label: {
                         Label("Stop Ringtone", systemImage: "speaker.slash.fill")
                     }
@@ -274,10 +339,25 @@ struct ContentView: View {
 
     // MARK: helpers
 
+    private func hardReset() {
+        // 1) мгновенно гасим пульсацию и звуки
+        withAnimation(.none) { pulse = false }
+        isRinging = false
+        SoundPlayer.shared.stop()
+        // 2) сбрасываем таймер и уведомления
+        NotificationManager.shared.cancelTimerNotification()
+        remaining = 0
+        state = .idle
+        // 3) пересоздаём вью, чтобы гарантированно обрубить repeatForever
+        animationID = UUID() // ★ ключевая строка
+    }
+
     private func stopRingtoneIfNeeded() {
         if isRinging {
             SoundPlayer.shared.stop()
             isRinging = false
+            withAnimation(.none) { pulse = false }
+            animationID = UUID() // ★ на всякий случай тоже «обнулим» анимации
         }
     }
 
@@ -295,16 +375,27 @@ struct ContentView: View {
         }
         .frame(height: 160)
     }
-    private func unitPicker(_ title: String, _ range: Range<Int>, selection: Binding<Int>) -> some View {
+    private func unitPicker(_ title: String,
+                            _ range: Range<Int>,
+                            selection: Binding<Int>) -> some View {
         VStack {
-            Picker(title, selection: selection) {
-                ForEach(range, id: \.self) { n in Text(String(format: "%02d", n)).tag(n) }
+            // Явная форма инициализации Picker, чтобы не было проблем с типами
+            Picker(selection: selection) {
+                ForEach(range, id: \.self) { n in
+                    Text(String(format: "%02d", n)).tag(n)
+                }
+            } label: {
+                Text(title)
             }
             .pickerStyle(.wheel)
-            Text(title).font(.caption).foregroundStyle(.secondary)
+
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity)
     }
+
     private func formatted(_ total: Int) -> String {
         let h = total / 3600
         let m = (total % 3600) / 60
@@ -374,7 +465,40 @@ struct RingtonePickerView: View {
         .toolbar {
             Button("Stop Preview") { SoundPlayer.shared.stop() }
         }
-        // 🔧 фикс: при уходе со страницы всегда выключаем предпрослушку
         .onDisappear { SoundPlayer.shared.stop() }
     }
 }
+
+// MARK: - Gradient Ring (фиолетовый, без блика/ползунка)
+
+struct GradientRing: View {
+    var progress: CGFloat          // 0...1
+    var lineWidth: CGFloat = 18    // толщина кольца
+    var startHue: Double = 0.78
+    var endHue:   Double = 0.88
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .stroke(Color.gray.opacity(0.20), lineWidth: lineWidth)
+
+            Circle()
+                .trim(from: 0, to: min(max(progress, 0), 1))
+                .stroke(
+                    AngularGradient(
+                        gradient: Gradient(colors: [
+                            Color(hue: startHue, saturation: 0.85, brightness: 0.96),
+                            Color(hue: endHue,   saturation: 0.85, brightness: 0.98),
+                            Color(hue: startHue, saturation: 0.85, brightness: 0.96)
+                        ]),
+                        center: .center
+                    ),
+                    style: StrokeStyle(lineWidth: lineWidth, lineCap: .round, lineJoin: .round)
+                )
+                .rotationEffect(.degrees(-90)) // старт сверху
+                .animation(.linear(duration: 0.2), value: progress)
+        }
+        .contentShape(Circle())
+    }
+}
+
